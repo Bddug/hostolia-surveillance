@@ -1,0 +1,77 @@
+# Surveillance exterieure des sites Hostolia : toutes les 10 minutes (GitHub peut retarder de quelques minutes),
+# un ordinateur de GitHub, hors de chez OVH, ouvre chaque adresse. Si une adresse ne repond pas apres 3 essais,
+# le controle echoue et GitHub envoie un e-mail au proprietaire du depot.
+# Le controle verifie aussi l'en-tete "X-Serveur: hostolia-ovh" : si quelqu'un detournait un nom de domaine
+# vers un autre serveur, l'alerte part aussi.
+name: Surveillance des sites
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      adresses:
+        description: "Adresses a tester (separees par des espaces). Vide = les sites habituels."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: surveillance
+  cancel-in-progress: false
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Tester les sites
+        env:
+          ADRESSES: ${{ inputs.adresses }}
+        run: |
+          URLS="${ADRESSES:-https://dwellingverify.com/ https://dwellingverify.com/api/ https://myrentalfigures.com/ https://myrentalfigures.com/api/demo}"
+          ECHEC=0
+          echo "| Adresse | Resultat |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for u in $URLS; do
+            ok=0; detail=""
+            for essai in 1 2 3; do
+              entetes=$(curl -s -o /dev/null -D - --max-time 20 "$u" || true)
+              code=$(printf '%s' "$entetes" | head -1 | awk '{print $2}')
+              if [ "$code" != 200 ]; then
+                detail="reponse ${code:-aucune}"
+              elif ! printf '%s' "$entetes" | grep -qi '^x-serveur: *hostolia-ovh'; then
+                detail="repond, mais PAS depuis notre serveur (nom de domaine detourne ?)"
+              else
+                ok=1; break
+              fi
+              if [ $essai -lt 3 ]; then sleep 30; fi
+            done
+            if [ $ok = 1 ]; then
+              echo "OK          $u"
+              echo "| $u | OK |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::EN PANNE : $u ($detail)"
+              echo "| $u | **EN PANNE** : $detail |" >> "$GITHUB_STEP_SUMMARY"
+              ECHEC=1
+            fi
+          done
+          exit $ECHEC
+
+      # GitHub arrete les controles programmes d'un depot public sans activite depuis 60 jours :
+      # une fois par mois, le controle enregistre la date dans le depot pour rester actif.
+      - uses: actions/checkout@v4
+        if: always() && github.event_name == 'schedule'
+      - name: Rester actif
+        if: always() && github.event_name == 'schedule'
+        run: |
+          derniere=$(git log -1 --format=%ct)
+          [ $(( $(date +%s) - derniere )) -gt $(( 30 * 86400 )) ] || exit 0
+          date -u '+%Y-%m-%d %H:%M UTC' > derniere-activite.txt
+          git config user.name "surveillance"
+          git config user.email "surveillance@users.noreply.github.com"
+          git add derniere-activite.txt
+          git commit -m "Surveillance : reste actif"
+          git push
